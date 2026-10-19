@@ -1,0 +1,17 @@
+Running Phase 1 training for seed=10
+skip strategy='random' seed=10 (already done)
+success rate (mean over tasks): 0.41
+skip strategy='hand crafted 1(naive)' seed=10 (already done)
+success rate (mean over tasks): 0.46
+skip strategy='hand crafted 2 (domain-informed)' seed=10 (already done)
+success rate (mean over tasks): 0.58
+seed 10 done in 0s -> ./results/results_phase1_seed10.json
+
+====================================
+CPU Time used: 00:00:00
+CPU Percent: 0%
+Memory usage: 0b
+Approx Power usage: 0.0
+Walltime usage: 00:00:56
+
+====================================

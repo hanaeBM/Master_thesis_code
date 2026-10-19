@@ -1,0 +1,9 @@
+{
+  "n_llm_calls": 41,
+  "n_revisions": 41,
+  "n_fallbacks": 5,
+  "n_invalid_items": 50,
+  "n_llm_errors": 0,
+  "episodes": 406,
+  "revision_freq": 10
+}

@@ -1,19 +1,11 @@
-# tested with Python 3.11
-pcgym @ git+https://github.com/MaximilianB2/pc-gym.git@d26cbc0690024efef488dc6a304d37654934e525
 
-torch>=2.0
-gymnasium>=0.29
-
-numpy==1.26.4
-ml-dtypes==0.5.3
-
-jax
-jaxlib
-
-matplotlib
-notebook
-ipykernel
-cryptography
-
-#if conda env : conda install -c conda-forge openssl before installing requirements
-#conda install -c conda-forge libiconv openssl cryptography
+#   pip install -r requirements.txt
+ 
+panda-gym==3.0.7
+gymnasium==1.3.0
+stable-baselines3[extra]==2.9.0
+pandas==3.0.2
+matplotlib==3.10.9
+numpy==2.4.4
+openai
+vllm
