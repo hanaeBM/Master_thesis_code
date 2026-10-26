@@ -831,7 +831,7 @@ def main():
     seed = args.seed
 
     results_path = os.path.join(args.out_dir, f"results/results_phase1_seed{seed}.json")
-    os.makedirs(os.path.dirname(results_path), exist_ok=True)      # [FIX] was missing: crash after hours of training
+    os.makedirs(os.path.dirname(results_path), exist_ok=True)     
 
     if os.path.exists(results_path):
         with open(results_path) as f:

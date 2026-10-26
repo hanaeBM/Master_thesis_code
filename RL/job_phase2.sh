@@ -1,7 +1,7 @@
 #!/bin/bash
 #PBS -N llm_single
-#PBS -l select=1:ncpus=8:mem=64gb:ngpus=1:gpu_type=L40S
-#PBS -l walltime=48:00:00
+#PBS -l select=1:ncpus=4:mem=16gb:ngpus=1
+#PBS -l walltime=24:00:00
 #PBS -J 10-14
 #PBS -j oe
 
