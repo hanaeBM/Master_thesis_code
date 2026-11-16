@@ -28,10 +28,12 @@ TASK_ENV_IDS = {
 }
 
 MAX_ROBOT_OBS_DIM = 7
+MAX_OBJECT_OBS_DIM = 24
 MAX_GOAL_DIM = 6
 N_TASKS = len(TASK_NAMES)
 
 SEEDS = [10, 11, 12, 13, 14]
+VALIDATION_SEEDS = [20, 21, 22]
 
 
 @dataclass
@@ -181,6 +183,13 @@ def pad_robot_obs(x: np.ndarray) -> np.ndarray:
     if x.shape[0] == MAX_ROBOT_OBS_DIM:
         return x
     new_x = np.zeros(MAX_ROBOT_OBS_DIM, dtype=np.float32)
+    new_x[: x.shape[0]] = x
+    return new_x
+
+
+def pad_object_obs(x: np.ndarray) -> np.ndarray:
+    x = np.asarray(x, dtype=np.float32).reshape(-1)
+    new_x = np.zeros(MAX_OBJECT_OBS_DIM, dtype=np.float32)
     new_x[: x.shape[0]] = x
     return new_x
 
@@ -428,32 +437,123 @@ class UCBAdaptiveCurriculum(Curriculum):
                 "learning_progress": {f"{n}/{l}": float(self.lp[i]) for i, (n, l) in enumerate(self.bins)}}
 
 
+class ZPDCurriculum(Curriculum):
+    """Baseline 5c (adaptive, non-LLM, no domain knowledge): "goals of intermediate difficulty"
+    (Florensa et al., 2018). Same 15 (task, distance-level) bins as the UCB baseline, but the signal is the
+    LEVEL of success of each bin, not its noisy change: bins whose success rate is close to 50% (neither
+    solved nor hopeless) get the most episodes.
+
+        s_i = (successes in the last WINDOW + K/2) / (episodes + K)      smoothed success rate (prior 0.5)
+        w_i = exp(-0.5 * ((s_i - TARGET) / SIGMA)^2)                    bump around TARGET
+        p_i = (w_i + EPS) / sum_j (w_j + EPS)                           EPS keeps every bin alive
+
+    Hyper-parameters are set a priori from the method's rationale and were NOT tuned on any run.
+    Targets are drawn on a radial shell, like the held-out zones and the UCB baseline."""
+
+    DIFFICULTY_LEVELS = ["near", "medium", "far"]
+    N_BINS = N_TASKS * len(DIFFICULTY_LEVELS)
+    DIFFICULTY_TO_FRACTION = [0.20, 0.55, 0.80]
+    BAND = 0.15
+    WINDOW = 20
+    PRIOR_COUNT = 4         # pseudo-episodes at 50% pulling small samples towards TARGET
+    TARGET = 0.5
+    SIGMA = 0.25
+    EPS = 0.05
+
+    def __init__(self):
+        self.bins = [(name, level) for name in TASK_NAMES for level in self.DIFFICULTY_LEVELS]
+        self.history = {i: [] for i in range(self.N_BINS)}
+        self.n_pulls = np.zeros(self.N_BINS, dtype=np.int64)
+        self._last_bin = None
+
+    def _success(self, i: int) -> float:
+        h = self.history[i][-self.WINDOW:]
+        return (float(np.sum(h)) + self.PRIOR_COUNT / 2.0) / (len(h) + self.PRIOR_COUNT)
+
+    def _probabilities(self) -> np.ndarray:
+        s = np.array([self._success(i) for i in range(self.N_BINS)])
+        w = np.exp(-0.5 * ((s - self.TARGET) / self.SIGMA) ** 2) + self.EPS
+        return w / w.sum()
+
+    def propose(self, rng: np.random.Generator) -> Tuple[int, np.ndarray]:
+        bin_idx = int(rng.choice(self.N_BINS, p=self._probabilities()))
+        name, level = self.bins[bin_idx]
+        spec = TASK_SPECS[name]
+        low, high = spec.goal_low, spec.goal_high
+        free = (high - low) > 1e-9
+        center = (low + high) / 2.0
+        half_diag = np.linalg.norm(((high - low) / 2.0)[free])
+        frac_center = self.DIFFICULTY_TO_FRACTION[self.DIFFICULTY_LEVELS.index(level)]
+        frac = rng.uniform(max(frac_center - self.BAND, 0.0), min(frac_center + self.BAND, 1.0))
+        g = rng.normal(size=int(free.sum()))
+        direction = np.zeros(len(low))
+        direction[free] = g / max(np.linalg.norm(g), 1e-9)
+        target = np.clip(center + direction * frac * half_diag, low, high)
+        self._last_bin = bin_idx
+        return spec.task_id, target.astype(np.float32)
+
+    def notify_result(self, task_id: int, success: bool) -> None:
+        self.n_pulls[self._last_bin] += 1
+        self.history[self._last_bin].append(bool(success))
+
+    def snapshot(self) -> Dict:
+        p = self._probabilities()
+        return {"n_pulls": {f"{n}/{l}": int(self.n_pulls[i]) for i, (n, l) in enumerate(self.bins)},
+                "success": {f"{n}/{l}": float(self._success(i)) for i, (n, l) in enumerate(self.bins)},
+                "probability": {f"{n}/{l}": float(p[i]) for i, (n, l) in enumerate(self.bins)}}
+
+
 class InformedAdaptiveCurriculum(Curriculum):
-   
- 
+    """Baseline 5b (informed + adaptive, non-LLM): receives the domain knowledge of Hand-crafted 2
+    (task GROUPS and ORDER) but not its fixed schedule; it ADAPTS the allocation itself.
+
+    Knowledge given (same as HC2):
+      * reach / push / slide form the non-grasping family and are trained together first;
+      * pick-and-place is introduced after that family, stack after pick-and-place
+        (same thresholds: 0.70 for the family, 0.50 on pick-and-place, same stack ramp).
+
+    What is adaptive (HC2 hard-codes all of this):
+      1. Task allocation = "competence gap". Among the unlocked tasks, the sampling weight is
+         proportional to 1 - rolling_success/ALLOC_MASTERY (floored at MIN_WEIGHT, capped at MAX_SHARE;
+         a newly introduced pick-and-place/stack that shows no learning only gets the floor),
+         so a mastered task keeps only a rehearsal share instead of eating budget (HC2 keeps
+         sampling mastered reach uniformly, then drops the whole family after unlocking
+         pick-and-place -> no rehearsal at all).
+      2. Unlock by stall or by budget as well as by mastery: if no family task has improved its best
+         rolling success for STALL_BLOCKS blocks of BLOCK episodes (after MIN_FAMILY_EPISODES), or after
+         MAX_FAMILY_EPISODES family episodes, pick-and-place is unlocked anyway (HC2 waits for all three
+         family tasks to reach 0.70, however long that takes).
+      3. Target distance follows competence on a radial shell (same sampler as the Adaptive
+         baseline and the held-out zones): the centre of the sampled fraction moves from near to
+         far as that task's success grows, and a COVERAGE share of draws is spread over the whole
+         range so the far/medium held-out zones are still seen (HC2's box shrinks to the centre
+         at mastery and stops covering them).
+    """
+
     ADVANCE_THRESHOLD = 0.70
     THRESHOLD_START_STACK = 0.50
     WINDOW = 20
     NON_GRASPING = ["reach", "push", "slide"]
     STACK_RAMP_EPISODES = 100
     STACK_MAX_SHARE = 0.70
- 
-    ALLOC_MASTERY = 0.90    
-    MIN_WEIGHT = 0.15       
-    PROBE_EPISODES = 2000  
-    PROBE_WINDOW = 200      
-    PROBE_SUCCESS = 0.08    
-    PROBE_WEIGHT = 0.04     
-    MAX_FAMILY_EPISODES = 4000   
-    MAX_SHARE = 0.60       
-    BLOCK = 100             
-    STALL_BLOCKS = 3        
-    STALL_DELTA = 0.03      
+
+    ALLOC_MASTERY = 0.90    # success at which a task's gap is considered closed (higher than the 0.70
+                            # unlock threshold: keep practising a task that is "unlocked" but not yet solid)
+    MIN_WEIGHT = 0.15       # rehearsal floor (relative weight of a mastered task)
+    PROBE_EPISODES = 2000   # a newly introduced grasping task is judged only after this many episodes ...
+    PROBE_WINDOW = 200      # ... on its last PROBE_WINDOW episodes:
+    PROBE_SUCCESS = 0.08    # still below this -> only a probe share (a floor-level task is not worth a full share)
+    PROBE_WEIGHT = 0.04     # relative weight of such a probe share
+    MAX_FAMILY_EPISODES = 4000   # the prerequisite family gets at most this many episodes before pick-and-place
+    MAX_SHARE = 0.60        # no single task can take more than this share of the draws
+    BLOCK = 100             # family episodes per stall-check block
+    STALL_BLOCKS = 3        # consecutive blocks without improvement -> family considered stalled
+    STALL_DELTA = 0.03      # minimum gain of a best rolling success to count as improvement
     MIN_FAMILY_EPISODES = 600
-    FRAC_NEAR, FRAC_FAR = 0.25, 0.85   
+    FRAC_NEAR, FRAC_FAR = 0.25, 0.85   # centre of the sampled distance fraction at success 0 / MASTERY
     BAND = 0.15
-    COVERAGE_SHARE = 0.25    
- 
+    COVERAGE_SHARE = 0.25   # share of draws spread over the whole radial range
+
     def __init__(self):
         self.history: Dict[str, List[bool]] = {n: [] for n in TASK_NAMES}
         self.family_done = False
@@ -464,14 +564,14 @@ class InformedAdaptiveCurriculum(Curriculum):
         self._best = {n: 0.0 for n in self.NON_GRASPING}
         self._stalled_blocks = 0
         self.unlock_reason = None
- 
+
     def _rolling_success(self, name: str) -> float:
         h = self.history[name]
         return float(np.mean(h[-self.WINDOW:])) if h else 0.0
- 
+
     def _is_mastered(self, name: str, threshold: float) -> bool:
         return self._rolling_success(name) >= threshold and len(self.history[name]) >= self.WINDOW
- 
+
     def _active_tasks(self) -> List[str]:
         active = list(self.NON_GRASPING)
         if self.p_and_p_unlocked:
@@ -479,12 +579,13 @@ class InformedAdaptiveCurriculum(Curriculum):
         if self.stack_unlocked:
             active.append("stack")
         return active
- 
+
     def _task_probabilities(self) -> Tuple[List[str], np.ndarray]:
         active = self._active_tasks()
         w = np.array([max(self.MIN_WEIGHT, 1.0 - self._rolling_success(n) / self.ALLOC_MASTERY) for n in active])
         for n in ("pickandplace", "stack"):   # no visible progress -> probe share only
-            if n in active and len(self.history[n]) >= self.PROBE_EPISODES and float(np.mean(self.history[n][-self.PROBE_WINDOW:])) < self.PROBE_SUCCESS:
+            if n in active and len(self.history[n]) >= self.PROBE_EPISODES \
+                    and float(np.mean(self.history[n][-self.PROBE_WINDOW:])) < self.PROBE_SUCCESS:
                 w[active.index(n)] = self.PROBE_WEIGHT
         if "stack" in active:   # same ramp as HC2 for the newly introduced stack
             stack_share = min(self.stack_episode_count / self.STACK_RAMP_EPISODES, self.STACK_MAX_SHARE)
@@ -494,7 +595,7 @@ class InformedAdaptiveCurriculum(Curriculum):
             p = np.minimum(p, self.MAX_SHARE)
             p = p / p.sum()
         return active, p
- 
+
     def propose(self, rng: np.random.Generator) -> Tuple[int, np.ndarray]:
         active, p = self._task_probabilities()
         name = active[int(rng.choice(len(active), p=p))]
@@ -503,7 +604,7 @@ class InformedAdaptiveCurriculum(Curriculum):
         free = (high - low) > 1e-9
         center = (low + high) / 2.0
         half_diag = np.linalg.norm(((high - low) / 2.0)[free])
- 
+
         if rng.random() < self.COVERAGE_SHARE:
             frac = rng.uniform(0.10, 0.90)
         else:
@@ -515,11 +616,11 @@ class InformedAdaptiveCurriculum(Curriculum):
         direction[free] = g / max(np.linalg.norm(g), 1e-9)
         target = np.clip(center + direction * frac * half_diag, low, high)
         return spec.task_id, target.astype(np.float32)
- 
+
     def notify_result(self, task_id: int, success: bool) -> None:
         name = TASK_NAMES[task_id]
         self.history[name].append(bool(success))
- 
+
         if not self.p_and_p_unlocked:
             if name in self.NON_GRASPING:
                 self._family_episodes += 1
@@ -537,12 +638,12 @@ class InformedAdaptiveCurriculum(Curriculum):
                 self.p_and_p_unlocked, self.unlock_reason = True, "stalled"
             elif self._family_episodes >= self.MAX_FAMILY_EPISODES:
                 self.p_and_p_unlocked, self.unlock_reason = True, "family_budget"
- 
+
         if self.p_and_p_unlocked and not self.stack_unlocked and self._is_mastered("pickandplace", self.THRESHOLD_START_STACK):
             self.stack_unlocked = True
         if self.stack_unlocked:
             self.stack_episode_count += 1
- 
+
     def snapshot(self) -> Dict:
         active, p = self._task_probabilities()
         return {"family_done": self.family_done, "p_and_p_unlocked": self.p_and_p_unlocked,
@@ -550,7 +651,8 @@ class InformedAdaptiveCurriculum(Curriculum):
                 "family_episodes": self._family_episodes,
                 "task_probability": {n: float(x) for n, x in zip(active, p)},
                 "rolling_success": {n: self._rolling_success(n) for n in TASK_NAMES}}
- 
+
+
 # 5. MultiTaskCurriculumEnv
 
 class MultiTaskCurriculumEnv(gym.Env):
@@ -577,7 +679,7 @@ class MultiTaskCurriculumEnv(gym.Env):
             e.reset(seed=int(self.rng.integers(0, 2**31 - 1)))
 
         self.action_space = spaces.Box(-1.0, 1.0, shape=(SHARED_ACTION_DIM,), dtype=np.float32)
-        obs_dim = MAX_ROBOT_OBS_DIM + N_TASKS
+        obs_dim = MAX_ROBOT_OBS_DIM + MAX_OBJECT_OBS_DIM + N_TASKS
         self.observation_space = spaces.Dict(
             dict(
                 observation=spaces.Box(-10.0, 10.0, shape=(obs_dim,), dtype=np.float32),
@@ -606,10 +708,11 @@ class MultiTaskCurriculumEnv(gym.Env):
         task_id = TASK_SPECS[name].task_id
         env = self.envs[name].unwrapped
         x = pad_robot_obs(env.robot.get_obs()[: (7 if not TASK_SPECS[name].block_gripper else 6)])
+        obj = pad_object_obs(env.task.get_obs())
         achieved = pad_goal(env.task.get_achieved_goal(), name)
         desired = pad_goal(env.task.get_goal(), name)
         return {
-            "observation": np.concatenate([x, one_hot_task(task_id)]).astype(np.float32),
+            "observation": np.concatenate([x, obj, one_hot_task(task_id)]).astype(np.float32),
             "achieved_goal": achieved,
             "desired_goal": desired,
         }
@@ -702,7 +805,7 @@ class MultiTaskCurriculumEnv(gym.Env):
 # 6. Training / evaluation harness
 
 N_EVAL_EPISODES_PER_ZONE = 5
-EVAL_FREQ = 1000
+EVAL_FREQ = 5000
 TOTAL_TIMESTEPS =2_000_000
 SNAPSHOT_EVERY = 10_000      # [GOAL LOG] curriculum state saved every N training steps
 HER_KWARGS = dict(n_sampled_goal=4, goal_selection_strategy="future", copy_info_dict=True)
@@ -788,6 +891,10 @@ def train_one_run(curriculum_factory, seed: int, total_timesteps: int, eval_freq
     eval_env = MultiTaskCurriculumEnv(RandomCurriculum(), seed=seed + 10_000, held_out_eval=True)
 
     model = make_model(train_env, seed=seed)
+    probe_env = None
+    if hasattr(train_env.curriculum, "attach"):
+        probe_env = MultiTaskCurriculumEnv(RandomCurriculum(), seed=seed + 20_000)
+        train_env.curriculum.attach(model, probe_env)
     cb = HeldOutEvalCallback(eval_env, eval_freq=eval_freq, n_episodes_per_zone=n_episodes_per_zone, verbose=verbose)
     model.learn(total_timesteps=total_timesteps, callback=cb, progress_bar=False)
 
@@ -796,6 +903,8 @@ def train_one_run(curriculum_factory, seed: int, total_timesteps: int, eval_freq
 
     train_env.close()
     eval_env.close()
+    if probe_env is not None:
+        probe_env.close()
     return cb.history
 
 
@@ -809,8 +918,7 @@ CURRICULUMS = {
     "random": RandomCurriculum,
     "hand crafted 1(naive)": HandCraftedCurriculum,
     "hand crafted 2 (domain-informed)": HandCraftedCurriculum2,
-   # "Adaptive": UCBAdaptiveCurriculum,
-    #"InformedAdaptiveCurriculum":InformedAdaptiveCurriculum
+   
 }
 STRATEGIES = list(CURRICULUMS.keys())
 
@@ -821,7 +929,7 @@ def _slug(name: str) -> str:
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--seed", type=int, required=True, choices=SEEDS,
+    parser.add_argument("--seed", type=int, required=True, choices=SEEDS + VALIDATION_SEEDS,
                          help="Which seed to run (one job = one seed).")
     parser.add_argument("--out-dir", type=str, default=".",
                          help="Directory to write results_phase1_seed<SEED>.json into.")
@@ -831,7 +939,7 @@ def main():
     seed = args.seed
 
     results_path = os.path.join(args.out_dir, f"results/results_phase1_seed{seed}.json")
-    os.makedirs(os.path.dirname(results_path), exist_ok=True)     
+    os.makedirs(os.path.dirname(results_path), exist_ok=True)      # [FIX] was missing: crash after hours of training
 
     if os.path.exists(results_path):
         with open(results_path) as f:

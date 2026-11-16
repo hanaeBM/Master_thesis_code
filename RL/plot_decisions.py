@@ -146,7 +146,7 @@ def main():
     "random",
     "hand crafted 1(naive)",
     "hand crafted 2 (domain-informed)",
-    "single-agent LLM",
+    "single-agent LLM (+hint) (+floor)",
     #"InformedAdaptiveCurriculum"
     ]
     

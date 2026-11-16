@@ -1,0 +1,11 @@
+{
+  "n_llm_calls": 688,
+  "n_revisions": 172,
+  "n_fallbacks": 0,
+  "n_invalid_items": 0,
+  "n_llm_errors": 0,
+  "episodes": 1716,
+  "n_floor_edits": 61,
+  "revision_freq": 10,
+  "process": "aggregator"
+}

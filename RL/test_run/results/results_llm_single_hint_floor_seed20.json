@@ -1,0 +1,36 @@
+{
+  "single-agent LLM (+hint) (+floor)": [
+    {
+      "timesteps": 5000,
+      "success_reach": 0.24,
+      "success_push": 0.0,
+      "success_slide": 0.0,
+      "success_pickandplace": 0.0,
+      "success_stack": 0.0
+    },
+    {
+      "timesteps": 10000,
+      "success_reach": 0.56,
+      "success_push": 0.0,
+      "success_slide": 0.0,
+      "success_pickandplace": 0.0,
+      "success_stack": 0.04
+    },
+    {
+      "timesteps": 15000,
+      "success_reach": 0.6,
+      "success_push": 0.08,
+      "success_slide": 0.0,
+      "success_pickandplace": 0.04,
+      "success_stack": 0.04
+    },
+    {
+      "timesteps": 20000,
+      "success_reach": 0.64,
+      "success_push": 0.0,
+      "success_slide": 0.0,
+      "success_pickandplace": 0.0,
+      "success_stack": 0.08
+    }
+  ]
+}

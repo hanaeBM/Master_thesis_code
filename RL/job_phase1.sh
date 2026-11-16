@@ -2,7 +2,7 @@
 
 #PBS -J 10-14
 #PBS -l select=1:ncpus=4:mem=16gb:ngpus=1
-#PBS -l walltime=48:0:0
+#PBS -l walltime=72:0:0
 #PBS -N phase1_seed
 
 cd $PBS_O_WORKDIR

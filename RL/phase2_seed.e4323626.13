@@ -1,7 +1,0 @@
-usage: train_phase2.py [-h] --seed {10,11,12,13,14} --llm-url LLM_URL
-                       [--model MODEL] [--out-dir OUT_DIR]
-                       [--revision-freq REVISION_FREQ]
-                       [--total-timesteps TOTAL_TIMESTEPS]
-                       [--eval-freq EVAL_FREQ]
-                       [--snapshot-every SNAPSHOT_EVERY]
-train_phase2.py: error: the following arguments are required: --llm-url
